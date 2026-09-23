@@ -568,3 +568,144 @@ with ReachyMini(media_backend="default") as mini:
 For the Wireless robot, use an app configured without unnecessary video streaming to reduce CPU load—for example, the repository’s app template mentions `gstreamer_no_video` for apps that do not use video.
 
 The repository search results may be incomplete; you can inspect additional audio-related code in the [Reachy Mini code search UI](https://github.com/pollen-robotics/reachy_mini/search?q=get_audio_sample&type=code).
+
+----
+
+Yes. For **Reachy Mini Lite**, the computation can happen entirely on your MacBook while the SDK controls the robot.
+
+```text
+MacBook microphone / Reachy Mini Lite microphone
+        ↓
+Reachy Mini SDK media backend
+        ↓
+aubio on macOS
+        ↓
+DetectedMusicInfo
+        ↓
+Reachy Mini movement or behavior
+```
+
+Install `aubio` in the same environment as your Reachy Mini SDK:
+
+```bash
+uv add aubio numpy
+```
+
+If you are not using a `pyproject.toml`:
+
+```bash
+uv pip install aubio numpy
+```
+
+For Lite, use the local/default media backend rather than `webrtc`:
+
+```python
+from reachy_mini import ReachyMini
+
+with ReachyMini(media_backend="default") as mini:
+    mini.media.start_recording()
+
+    sample_rate = mini.media.get_input_audio_samplerate()
+    sample = mini.media.get_audio_sample()
+
+    mini.media.stop_recording()
+```
+
+The SDK’s local audio implementation uses macOS audio through GStreamer’s `osxaudiosrc`; the `default` backend is therefore appropriate when the daemon and application are running on your Mac. The SDK recording example uses the same `start_recording()` / `get_audio_sample()` flow: [examples/sound_record.py](https://github.com/pollen-robotics/reachy_mini/blob/main/examples/sound_record.py).
+
+A five-second rolling detector could look like this:
+
+```python name=music_detector_lite.py
+import time
+from collections import deque
+
+import aubio
+import numpy as np
+from reachy_mini import ReachyMini
+
+
+WINDOW_SECONDS = 5.0
+HOP_SIZE = 512
+BUFFER_SIZE = 1024
+
+
+def estimate_bpm(samples: np.ndarray, sample_rate: int) -> float | None:
+    samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+    samples -= np.mean(samples)
+
+    peak = np.max(np.abs(samples), initial=0.0)
+    if peak > 1.0:
+        samples /= peak
+
+    tempo = aubio.tempo(
+        "default",
+        BUFFER_SIZE,
+        HOP_SIZE,
+        sample_rate,
+    )
+
+    estimates: list[float] = []
+
+    for offset in range(0, len(samples), HOP_SIZE):
+        frame = samples[offset : offset + HOP_SIZE]
+
+        if len(frame) < HOP_SIZE:
+            frame = np.pad(frame, (0, HOP_SIZE - len(frame)))
+
+        if tempo(frame)[0]:
+            bpm = float(tempo.get_bpm())
+
+            if 40.0 <= bpm <= 240.0:
+                estimates.append(bpm)
+
+    if not estimates:
+        return None
+
+    # Median is more robust than using the final aubio estimate.
+    return float(np.median(estimates))
+
+
+with ReachyMini(media_backend="default") as mini:
+    mini.media.start_recording()
+
+    sample_rate = mini.media.get_input_audio_samplerate()
+    window_size = int(WINDOW_SECONDS * sample_rate)
+    audio_window: deque[float] = deque(maxlen=window_size)
+
+    print(f"Listening at {sample_rate} Hz...")
+
+    try:
+        while True:
+            sample = mini.media.get_audio_sample()
+
+            if sample is None:
+                time.sleep(0.005)
+                continue
+
+            audio_window.extend(
+                np.asarray(sample, dtype=np.float32).reshape(-1)
+            )
+
+            if len(audio_window) >= window_size:
+                bpm = estimate_bpm(
+                    np.asarray(audio_window),
+                    sample_rate,
+                )
+                print(f"BPM: {bpm}")
+    finally:
+        mini.media.stop_recording()
+```
+
+For your `MusicDetector`, the important adaptation is that `AudioChunk` should contain or wrap the arrays returned by:
+
+```python
+mini.media.get_audio_sample()
+```
+
+and the sample rate should come from:
+
+```python
+mini.media.get_input_audio_samplerate()
+```
+
+You do **not** need to install `aubio` on the robot for the Lite setup. You also do not need `media_backend="webrtc"` when the daemon and your Python app are both running locally on the Mac.
