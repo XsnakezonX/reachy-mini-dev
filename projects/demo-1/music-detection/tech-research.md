@@ -379,3 +379,192 @@ Let me know if you want platform-specific troubleshooting or build-from-source i
 2. [Platform support | uv - Astral](https://docs.astral.sh/uv/reference/policies/platforms/)
 3. [aubio-ledfx · PyPI](https://pypi.org/project/aubio-ledfx/)
 4. [python-aubio (aarch64) | Packages | Arch Linux ARM](https://archlinuxarm.org/packages/aarch64/python-aubio)
+
+Yes—**both are possible**.
+
+## Option 1: Process on the Reachy Mini robot
+
+For a **Reachy Mini Wireless**, this is the best option for autonomous behavior:
+
+```text
+Reachy Mini microphone
+        ↓
+Reachy Mini SDK / GStreamer
+        ↓
+aubio BPM detection
+        ↓
+robot movement or reaction
+```
+
+Your Python app runs on the robot, captures audio with:
+
+```python
+mini.media.start_recording()
+sample = mini.media.get_audio_sample()
+```
+
+and passes the samples directly to `aubio`. The SDK exposes the microphone sample rate through:
+
+```python
+sample_rate = mini.media.get_input_audio_samplerate()
+```
+
+The repository’s recording example follows this pattern: [examples/sound_record.py](https://github.com/pollen-robotics/reachy_mini/blob/main/examples/sound_record.py).
+
+Install `aubio` in the robot/app environment:
+
+```bash
+uv pip install aubio
+```
+
+For an app managed by a `pyproject.toml`:
+
+```bash
+uv add aubio
+```
+
+This avoids sending approximately five seconds of raw audio over the network and is preferable for continuous music-reactive behavior.
+
+## Option 2: Process on your MacBook
+
+You can also run the detector on your Mac.
+
+### MacBook microphone
+
+If you want to analyze audio captured by the Mac itself, use a local audio input library such as `sounddevice` or the SDK’s local media backend:
+
+```bash
+uv add aubio sounddevice
+```
+
+### Reachy Mini microphone streamed to the Mac
+
+If the audio should come from Reachy Mini’s microphone array, connect using the SDK’s WebRTC media backend:
+
+```python
+from reachy_mini import ReachyMini
+
+with ReachyMini(media_backend="webrtc") as mini:
+    mini.media.start_recording()
+
+    sample_rate = mini.media.get_input_audio_samplerate()
+    sample = mini.media.get_audio_sample()
+```
+
+The SDK supports `default`, `local`, and `webrtc` media backends in its recording example. The WebRTC option lets your Mac receive the robot’s audio and run `aubio` locally.
+
+## Which should you choose?
+
+| Requirement | Recommended location |
+|---|---|
+| Robot should react autonomously | Robot |
+| Lowest audio latency | Robot |
+| Lowest CM4 CPU usage | MacBook |
+| Easier development and debugging | MacBook |
+| Testing with recorded clips | MacBook |
+| Published/on-robot Python app | Robot |
+| Remote web application | MacBook/browser side |
+
+For your `MusicDetector`, I would use:
+
+```text
+Wireless Reachy Mini:
+    media samples → aubio on robot → DetectedMusicInfo → robot motion
+
+MacBook development:
+    WebRTC samples → aubio on Mac → tune detector
+```
+
+Then move the same detector code to the robot once the thresholds are working.
+
+## Important backend distinction
+
+- **Reachy Mini Wireless:** the microphone physically belongs to the robot. For on-robot processing, use the local/GStreamer path.
+- **Reachy Mini Lite:** the robot is controlled by your computer, so audio is generally available through the computer’s local audio system.
+- **MacBook controlling Wireless Reachy Mini:** use `media_backend="webrtc"` if detection runs on the Mac; use the robot-side app/local backend if detection runs on the robot.
+
+A minimal robot-side collection loop would look like this:
+
+```python name=robot_music_detector.py
+import time
+from collections import deque
+
+import aubio
+import numpy as np
+from reachy_mini import ReachyMini
+
+
+HOP_SIZE = 512
+BUFFER_SIZE = 1024
+WINDOW_SECONDS = 5.0
+
+
+def estimate_bpm(samples: np.ndarray, sample_rate: int) -> float | None:
+    samples = np.asarray(samples, dtype=np.float32)
+
+    if samples.ndim == 2:
+        samples = samples.mean(axis=1)
+
+    samples -= np.mean(samples)
+
+    peak = np.max(np.abs(samples), initial=0.0)
+    if peak > 1.0:
+        samples /= peak
+
+    tempo_detector = aubio.tempo(
+        "default",
+        BUFFER_SIZE,
+        HOP_SIZE,
+        sample_rate,
+    )
+
+    bpm_values = []
+
+    for start in range(0, len(samples), HOP_SIZE):
+        frame = samples[start : start + HOP_SIZE]
+
+        if len(frame) < HOP_SIZE:
+            frame = np.pad(frame, (0, HOP_SIZE - len(frame)))
+
+        if tempo_detector(frame)[0]:
+            bpm = float(tempo_detector.get_bpm())
+            if 40 <= bpm <= 240:
+                bpm_values.append(bpm)
+
+    if not bpm_values:
+        return None
+
+    return float(np.median(bpm_values))
+
+
+with ReachyMini(media_backend="default") as mini:
+    mini.media.start_recording()
+
+    sample_rate = mini.media.get_input_audio_samplerate()
+    required_samples = int(WINDOW_SECONDS * sample_rate)
+    audio_window = deque(maxlen=required_samples)
+
+    try:
+        while True:
+            sample = mini.media.get_audio_sample()
+
+            if sample is None:
+                time.sleep(0.005)
+                continue
+
+            audio_window.extend(np.asarray(sample).reshape(-1))
+
+            if len(audio_window) >= required_samples:
+                bpm = estimate_bpm(
+                    np.asarray(audio_window),
+                    sample_rate,
+                )
+
+                print(f"Estimated BPM: {bpm}")
+    finally:
+        mini.media.stop_recording()
+```
+
+For the Wireless robot, use an app configured without unnecessary video streaming to reduce CPU load—for example, the repository’s app template mentions `gstreamer_no_video` for apps that do not use video.
+
+The repository search results may be incomplete; you can inspect additional audio-related code in the [Reachy Mini code search UI](https://github.com/pollen-robotics/reachy_mini/search?q=get_audio_sample&type=code).
