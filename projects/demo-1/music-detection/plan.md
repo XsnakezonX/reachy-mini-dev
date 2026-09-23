@@ -249,3 +249,133 @@ audio_buffer.sample_rate
 ```
 
 but the repository search did not expose the detector or `AudioChunk` definitions in the indexed results, so those names may need to be adapted. The code-search results can be incomplete; more results are available in the [Reachy Mini code search UI](https://github.com/pollen-robotics/reachy_mini/search?q=AudioChunk&type=code).
+
+Yes—**`aubio` is generally a better fit for on-robot Reachy Mini processing** than `librosa` because it is lightweight and designed for streaming onset/tempo detection. It should use less CPU and memory on the CM4, although exact install success depends on the robot’s Python version and ARM64 environment.
+
+For an existing Reachy Mini virtual environment:
+
+```bash
+uv pip install aubio
+```
+
+If you manage dependencies in a `pyproject.toml`, prefer:
+
+```bash
+uv add aubio
+```
+
+Then verify:
+
+```bash
+python -c "import aubio; print(aubio.version)"
+```
+
+If the standard package has no compatible ARM64 wheel and compilation fails, try:
+
+```bash
+uv pip install aubio-ledfx
+```
+
+`aubio-ledfx` is a compatible fork that may provide prebuilt ARM64 wheels. Avoid `--system` unless you intentionally want to modify the system Python; the Reachy Mini app environment is preferable.
+
+### Minimal aubio BPM example
+
+```python
+import aubio
+import numpy as np
+
+
+def estimate_bpm(
+    samples: np.ndarray,
+    sample_rate: int,
+    *,
+    hop_size: int = 512,
+    buffer_size: int = 1024,
+) -> float | None:
+    samples = np.asarray(samples, dtype=np.float32)
+
+    if samples.ndim == 2:
+        samples = samples.mean(axis=1)
+
+    samples = samples - np.mean(samples)
+
+    peak = np.max(np.abs(samples), initial=0.0)
+    if peak > 1.0:
+        samples = samples / peak
+
+    tempo_detector = aubio.tempo(
+        "default",
+        buffer_size,
+        hop_size,
+        sample_rate,
+    )
+
+    bpm_values: list[float] = []
+
+    for start in range(0, len(samples), hop_size):
+        frame = samples[start : start + hop_size]
+
+        if len(frame) < hop_size:
+            frame = np.pad(frame, (0, hop_size - len(frame)))
+
+        frame = frame.astype(np.float32)
+        is_beat = tempo_detector(frame)[0]
+
+        if is_beat:
+            bpm = float(tempo_detector.get_bpm())
+            if 40.0 <= bpm <= 240.0:
+                bpm_values.append(bpm)
+
+    if not bpm_values:
+        return None
+
+    return float(np.median(bpm_values))
+```
+
+For a five-second clip, I would use aubio as a **candidate BPM detector**, then require at least several detected beats and possibly average across overlapping windows. `aubio` alone does not reliably determine whether audio is music versus speech or rhythmic noise.
+
+### 1. uv Command to Install Python aubio Package
+
+The current recommended command to install the aubio package using `uv` (Astral's fast Python packaging tool) is:
+
+```
+uv pip install aubio
+```
+
+or, for [project-managed installs](https://docs.astral.sh/uv/reference/uv/), use:
+
+```
+uv pip install --system aubio
+```
+
+`uv` is fully supported on Raspberry Pi OS aarch64 (64-bit), and works as a replacement for pip in nearly all Python package install workflows[[1]](https://pydevtools.com/handbook/how-to/how-to-run-python-scripts-on-a-raspberry-pi-with-uv/)[[2]](https://docs.astral.sh/uv/reference/policies/platforms/).
+
+If you want the most recent features and best compatibility, consider the actively maintained fork, especially for Python 3.10+ and ARM:
+
+```
+uv pip install aubio-ledfx
+```
+
+(`aubio-ledfx` is a drop-in replacement with prebuilt wheels for Linux ARM64.)[[3]](https://pypi.org/project/aubio-ledfx/)
+
+---
+
+### 2. ARM64 (Raspberry Pi CM4) Support
+
+**Yes, aubio supports Linux ARM64, including the Raspberry Pi CM4.**  
+- The mainline aubio project is periodically packaged for ARM64 Linux distros such as Arch Linux ARM[[4]](https://archlinuxarm.org/packages/aarch64/python-aubio).
+- The `aubio-ledfx` fork provides prebuilt wheels for Python 3.8–3.14 on Linux ARM64 (manylinux), which means you can use `pip` or `uv` to install it directly on Raspberry Pi CM4 running 64-bit Raspberry Pi OS[[3]](https://pypi.org/project/aubio-ledfx/).
+
+> **Summary:**  
+> - For the latest, easiest ARM64 install, use: `uv pip install aubio-ledfx`
+> - For the classic package: `uv pip install aubio`
+> - ARM64 (Raspberry Pi 4/CM4, 64-bit OS) is well supported by both `uv` and the aubio Python package.
+
+Let me know if you want platform-specific troubleshooting or build-from-source instructions!
+
+---
+
+1. [How to run Python scripts on a Raspberry Pi with uv](https://pydevtools.com/handbook/how-to/how-to-run-python-scripts-on-a-raspberry-pi-with-uv/)
+2. [Platform support | uv - Astral](https://docs.astral.sh/uv/reference/policies/platforms/)
+3. [aubio-ledfx · PyPI](https://pypi.org/project/aubio-ledfx/)
+4. [python-aubio (aarch64) | Packages | Arch Linux ARM](https://archlinuxarm.org/packages/aarch64/python-aubio)
